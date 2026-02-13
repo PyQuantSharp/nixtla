@@ -24,10 +24,10 @@ import os
 import shutil
 import subprocess
 import sys
-
 from dataclasses import dataclass
+from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -36,7 +36,6 @@ from rich import print
 from rich.markdown import Markdown
 from rich.prompt import Confirm, Prompt
 from snowflake.snowpark import Session
-from pathlib import Path
 
 # ============================================================================
 # Constants
@@ -305,10 +304,10 @@ def show_available_objects(session: Session, object_type: str) -> None:
     """Display available Snowflake objects of given type."""
     try:
         if object_type == "DATABASES":
-            objects = [row[1] for row in session.sql("SHOW DATABASES").collect()]
+            objects = [str(row[1]) for row in session.sql("SHOW DATABASES").collect()]
             print(f"[cyan]Available databases: {', '.join(objects)}[/cyan]")
         elif object_type == "SCHEMAS":
-            objects = [row[1] for row in session.sql("SHOW SCHEMAS").collect()]
+            objects = [str(row[1]) for row in session.sql("SHOW SCHEMAS").collect()]
             preview = objects[:10]
             suffix = "..." if len(objects) > 10 else ""
             print(f"[cyan]Available schemas: {', '.join(preview)}{suffix}[/cyan]")
@@ -582,33 +581,50 @@ def detect_package_installer() -> tuple[list[str], bool]:
     )
 
 
-def package_and_upload_nixtla(session: Session, stage: str) -> None:
+def package_and_upload_nixtla(
+    session: Session, stage: str, fallback_package_source: Optional[str] = None
+) -> None:
     """
     Package nixtla client and upload to Snowflake stage.
 
     Args:
         session: Active Snowflake session
         stage: Stage name to upload to
+        fallback_package_source: Local path to nixtla package (e.g. project root)
+            used as a fallback when the current version is not yet on PyPI.
     """
     with TemporaryDirectory() as tmpdir:
-        # Import version from nixtla package
         from nixtla import __version__ as nixtla_version
 
         # Detect package installer
         pip_cmd, use_uv = detect_package_installer()
 
-        # Install packages with appropriate flags
-        # UV uses --target instead of -t
-        install_args = pip_cmd + [
+        # Build base install args (shared between PyPI and fallback attempts)
+        base_args = pip_cmd + [
             "--target" if use_uv else "-t",
             tmpdir,
-            f"nixtla=={nixtla_version}",
-            "utilsforecast",
-            "httpx",
-            "--no-deps",  # Avoid pulling in heavy things like pandas/numpy into the ZIP
         ]
+        extra_deps = ["utilsforecast", "httpx"]
+        no_deps_flag = ["--no-deps"]  # Avoid pulling in heavy things like pandas/numpy
 
-        subprocess.run(install_args, check=True)
+        # Try the released PyPI version first
+        pypi_args = (
+            base_args + [f"nixtla=={nixtla_version}"] + extra_deps + no_deps_flag
+        )
+        pip_result = subprocess.run(pypi_args)
+
+        if pip_result.returncode != 0 and fallback_package_source is not None:
+            print(
+                f"[yellow]nixtla=={nixtla_version} not found on PyPI, "
+                f"falling back to local package: {fallback_package_source}[/yellow]"
+            )
+            fallback_args = (
+                base_args + [fallback_package_source] + extra_deps + no_deps_flag
+            )
+            pip_result = subprocess.run(fallback_args, check=True)
+
+        # Check whether the pip installation run successfully
+        pip_result.check_returncode()
 
         # Create zip archive
         shutil.make_archive(os.path.join(tmpdir, "nixtla"), "zip", tmpdir)
@@ -733,7 +749,7 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
     }
 
     # Forecast UDTF (with exogenous variables support)
-    @udtf(
+    @udtf(  # type: ignore[misc]
         input_types=[MapType(), MapType()],
         output_schema=StructType(
             [
@@ -749,7 +765,8 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
     )
     class ForecastUDTF:
         def __init__(self):
-            import _snowflake
+            import _snowflake  # type: ignore
+
             from nixtla import NixtlaClient
 
             token = _snowflake.get_generic_secret_string(SECRET_API_KEY)
@@ -856,7 +873,7 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
             #   Column 0 (MapType): PARAMS config object, same for every row
             #   Column 1 (MapType): data_obj from OBJECT_CONSTRUCT_KEEP_NULL(*),
             #                       each row is a dict of the original table columns
-            config = df.iloc[0, 0]
+            config: dict[str, Any] = df.iloc[0, 0]  # type: ignore[assignment]
             if config.get("finetune_steps", 0) > 0:
                 raise ValueError("Finetuning is not allowed during forecasting")
 
@@ -954,7 +971,7 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
         end_partition._sf_vectorized_input = pd.DataFrame  # type: ignore
 
     # Evaluate UDTF
-    @udtf(
+    @udtf(  # type: ignore[misc]
         input_types=[ArrayType(), MapType()],
         output_schema=StructType(
             [
@@ -1026,7 +1043,7 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
         end_partition._sf_vectorized_input = pd.DataFrame  # type: ignore
 
     # Anomaly Detection UDTF
-    @udtf(
+    @udtf(  # type: ignore[misc]
         input_types=[MapType(), StringType(), TimestampType(), DoubleType()],
         output_schema=StructType(
             [
@@ -1045,7 +1062,8 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
     )
     class AnomalyDetectionUDTF:
         def __init__(self):
-            import _snowflake
+            import _snowflake  # type: ignore
+
             from nixtla import NixtlaClient
 
             token = _snowflake.get_generic_secret_string(SECRET_API_KEY)
@@ -1096,11 +1114,11 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
             """Execute anomaly detection for a partition."""
             # Prepare inputs
             input_df = self._prepare_input_data(df)
-            config = df.iloc[0, 0]
+            config: dict[str, Any] = df.iloc[0, 0]  # type: ignore[assignment]
             level = config.get("level", 99)
 
             # Detect anomalies
-            anomalies = self.client.detect_anomalies(df=input_df, **config)
+            anomalies = self.client.detect_anomalies(df=input_df, **config)  # type: ignore[arg-type]
 
             # Extract bounds and format output
             result = self._extract_confidence_bounds(anomalies, level)
@@ -1111,7 +1129,7 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
         end_partition._sf_vectorized_input = pd.DataFrame  # type: ignore
 
     # Explain UDTF (feature contributions / SHAP values)
-    @udtf(
+    @udtf(  # type: ignore[misc]
         input_types=[MapType(), MapType()],
         output_schema=StructType(
             [
@@ -1130,7 +1148,8 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
         """UDTF for computing feature contributions (SHAP values) in long format."""
 
         def __init__(self):
-            import _snowflake
+            import _snowflake  # type: ignore
+
             from nixtla import NixtlaClient
 
             token = _snowflake.get_generic_secret_string(SECRET_API_KEY)
@@ -1143,7 +1162,7 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
             #   Column 0 (MapType): PARAMS config object, same for every row
             #   Column 1 (MapType): data_obj from OBJECT_CONSTRUCT_KEEP_NULL(*),
             #                       each row is a dict of the original table columns
-            config = dict(df.iloc[0, 0])
+            config: dict[str, Any] = dict(df.iloc[0, 0])  # type: ignore[arg-type]
             if config.get("finetune_steps", 0) > 0:
                 raise ValueError("Finetuning is not allowed during explain")
 
@@ -1215,7 +1234,7 @@ def create_udtfs(session: Session, config: DeploymentConfig) -> None:
                     "Ensure exogenous variables are provided via hist_exog_list or futr_exog_list."
                 )
 
-            contrib_df = self.client.feature_contributions
+            contrib_df: pd.DataFrame = self.client.feature_contributions  # type: ignore[assignment]
 
             # Identify feature columns (everything except unique_id, ds, TimeGPT)
             id_cols = ["unique_id", "ds"]
@@ -1306,7 +1325,7 @@ def create_finetune_sproc(session: Session, config: DeploymentConfig) -> None:
     @sproc(
         session=session,
         name="nixtla_finetune",
-        packages=PACKAGES,
+        packages=PACKAGES,  # type: ignore[arg-type]
         imports=[f"@{config.stage}/nixtla.zip"],
         replace=True,
         is_permanent=True,
@@ -1319,8 +1338,9 @@ def create_finetune_sproc(session: Session, config: DeploymentConfig) -> None:
         params: Optional[dict] = None,
         max_series: int = 1000,
     ) -> str:
-        import _snowflake
+        import _snowflake  # type: ignore
         from snowflake.snowpark import functions as F
+
         from nixtla import NixtlaClient
 
         if params is None:
@@ -1865,6 +1885,7 @@ def deploy_snowflake_core(
     deploy_procedures: bool = True,
     deploy_finetune: bool = True,
     deploy_examples: bool = True,
+    fallback_package_source: Optional[str] = None,
 ) -> DeploymentConfig:
     """
     Core deployment logic without user interaction.
@@ -1883,6 +1904,8 @@ def deploy_snowflake_core(
         deploy_procedures: Whether to create stored procedures
         deploy_finetune: Whether to create finetune stored procedure
         deploy_examples: Whether to load example datasets
+        fallback_package_source: Local path to nixtla package (e.g. project root)
+            used as a fallback when the current version is not yet on PyPI.
 
     Returns:
         DeploymentConfig that was used for deployment
@@ -1895,7 +1918,9 @@ def deploy_snowflake_core(
         create_security_integration(session, config, api_key, skip_confirmation=True)
 
     if deploy_package:
-        package_and_upload_nixtla(session, config.stage)
+        package_and_upload_nixtla(
+            session, config.stage, fallback_package_source=fallback_package_source
+        )
 
     if deploy_udtfs:
         create_udtfs(session, config)
